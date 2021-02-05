@@ -1,0 +1,192 @@
+---
+- name: install wget
+  yum:
+    name: wget
+    state: present
+
+- name: update cache
+  apt:
+
+    update_cache: yes
+    cache_valid_time: 3600
+
+- name: install openjdk
+  apt:
+    name: openjdk-11-jdk 
+    state: present
+
+- name: install desktop packages 
+  apt: name={{ item }} state=latest update_cache=yes force_apt_get=yes
+  loop: ['ncat','tightvncserver','fonts-liberation','vim']
+
+- name: Does the Google apt file exist?
+  command: test -f {{google_apt_file}}
+  register: google_apt_exists
+  ignore_errors: True
+
+- name: Add Google Chrome key
+  shell: wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add -
+  when: google_apt_exists.rc == 1
+
+- name: Add Google Chrome repo
+  copy: content="deb http://dl.google.com/linux/chrome/deb/ stable main" dest={{google_apt_file}} owner=root group=root mode=644
+  when: google_apt_exists.rc == 1
+
+- name: Update apt cache
+  apt: update_cache=yes
+  when: google_apt_exists.rc == 1
+
+- name: Install Google Chrome
+  apt: pkg=google-chrome-stable state=present
+
+- name: Add an apt signing key for Kubernetes
+  apt_key:
+    url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+    state: present
+
+- name: Adding apt repository for Kubernetes
+  apt_repository:
+    repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+    state: present
+    filename: kubernetes.list
+
+- name: Install Kubernetes binaries
+  apt: 
+    name: "{{ packages }}"
+    state: present
+    update_cache: yes
+  vars:
+    packages:
+        - kubectl
+
+- name: Install Jenkins apt repository key 
+  apt_key:
+    url: https://pkg.jenkins.io/debian-stable/jenkins.io.key
+    state: present 
+
+- name: Configure jenkins repository 
+  apt_repository:
+    repo: 'deb https://pkg.jenkins.io/debian-stable binary/'
+    state: present
+
+- name: install jenkins
+  apt:
+    name: jenkins
+    update_cache: yes
+    state: present
+
+- name: start jenkins
+  systemd:
+    name: jenkins
+    state: started
+
+- name: enable jenkins
+  systemd:
+    name: jenkins
+    enabled: true
+
+- name: sleep for 30 seconds and continue with play
+  wait_for: timeout=30
+  delegate_to: localhost
+
+- name: init password jenkin
+  shell: cat /var/lib/jenkins/secrets/initialAdminPassword
+  changed_when: false
+  register: result
+
+- name: Set Jenkins admin password fact.
+  set_fact:
+    jenkins_admin_password: result.stdout 
+  no_log: true
+- name: Check if jenkins_init_file exists.
+  stat:
+    path: "{{ jenkins_init_file }}"
+  register: jenkins_init_file_stat
+
+- name: Ensure jenkins_init_file exists.
+  file:
+    path: "{{ jenkins_init_file }}"
+    state: touch
+    mode: 0644
+  when: not jenkins_init_file_stat.stat.exists
+
+- name: Modify variables in init file.
+  lineinfile:
+    dest: "{{ jenkins_init_file }}"
+    insertafter: '^{{ item.option }}='
+    regexp: '^{{ item.option }}=\"\${{ item.option }} '
+    line: '{{ item.option }}="${{ item.option }} {{ item.value }}"'
+    state: present
+    mode: 0644
+  with_items: "{{ jenkins_init_changes }}"
+  register: jenkins_init_prefix
+
+- name: Ensure jenkins_home {{ jenkins_home }} exists.
+  file:
+    path: "{{ jenkins_home }}"
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: u+rwx
+    follow: true
+
+- name: Set the Jenkins home directory.
+  lineinfile:
+    dest: "{{ jenkins_init_file }}"
+    regexp: '^JENKINS_HOME=.*'
+    line: 'JENKINS_HOME={{ jenkins_home }}'
+    mode: 0644
+  register: jenkins_home_config
+
+# Update Jenkins so that plugin updates don't fail.
+- name: Create Jenkins updates directory.
+  file:
+    path: "{{ jenkins_home }}/updates"
+    state: directory
+    owner: jenkins
+    group: jenkins
+    mode: 0755
+
+- name: Download current plugin updates from Jenkins update site.
+  get_url:
+    url: "{{ jenkins_updates_url }}/update-center.json"
+    dest: "{{ jenkins_home }}/updates/default.json"
+    owner: jenkins
+    group: jenkins
+    mode: 0440
+  changed_when: false
+  register: get_result
+  until: get_result is success
+  retries: 3
+  delay: 2
+
+- name: Remove first and last line from json file.
+  replace:  # noqa 208
+    path: "{{ jenkins_home }}/updates/default.json"
+    regexp: "1d;$d"
+
+- name: Install Jenkins plugins using password.
+  jenkins_plugin:
+    name: "{{ item.name | default(item) }}"
+    version: "{{ item.version | default(omit) }}"
+    jenkins_home: "{{ jenkins_home }}"
+    url_username: "{{ jenkins_admin_username }}"
+    url_password: "{{ jenkins_admin_password }}"
+    state: "{{ 'present' if item.version is defined else jenkins_plugins_state }}"
+    timeout: "{{ jenkins_plugin_timeout }}"
+    updates_expiration: "{{ jenkins_plugin_updates_expiration }}"
+    updates_url: "{{ jenkins_updates_url }}"
+    url: "http://{{ jenkins_hostname }}:{{ jenkins_http_port }}{{ jenkins_url_prefix }}"
+    with_dependencies: "{{ jenkins_plugins_install_dependencies }}"
+  with_items: "{{ jenkins_plugins }}"
+  when: jenkins_admin_password | default(false)
+  notify: restart jenkins
+  tags: ['skip_ansible_lint']
+  register: plugin_result
+  until: plugin_result is success
+  retries: 3
+  delay: 2
+
+- name: print init password jenkins
+  debug:
+    var: result.stdout

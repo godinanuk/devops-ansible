@@ -1,0 +1,4 @@
+---
+create_containers: 1
+default_container_name: sonarqube 
+default_container_image: sonarqube:7.9.5-community 

@@ -1,0 +1,8 @@
+---
+- name: Install docker 
+  hosts: docker
+  gather_facts: false
+  become: true
+  tasks:
+  - import_role:
+      name: docker
